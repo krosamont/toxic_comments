@@ -1,0 +1,705 @@
+---
+title: "Toxic Comment Classification Challenge"
+author: "Kevin"
+output:
+  html_document:
+    number_sections: true
+    toc: true
+    fig_width: 10
+    code_folding: hide
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+---
+
+#Introduction
+
+The aim of this competition is to be able to detect 6 different type of comments:<br>
+
+• toxic <br>
+• severely toxic <br>
+• obscene <br>
+• insult <br>
+• threat <br>
+• individual hate
+
+For that I have a training dataset containing 159571 comments. Some of them can be classified in more than one category. Each of these categories corresponds to a column. When the comment belongs to a category, it takes the value 1 and  if not, it takes the value 0. 
+Most of the comments that are in the dataset are just regular comments, they have the value 0 for all categories. Thankfully most people know how to behave on the internet!
+
+In this post, I will introduce how I process the data and then train a model to detect these toxic comments. In the first part I will get to know the data better with EDA (Exploratory Data Analysis). Then I will clean and prepare the data in 3 ways.
+In the second part, I will split the data  in 2 parts. The training set will represent 80% of the data and the validation data  will represent the other 20%. 
+
+The training set will be used to make our neural network model and the validation set will be used to see how the model performs on new data. A model with 2 GRU layers will be used to make the neural network.
+`model1` will be the one without pretrained embedding and  `model2` will use the GloVe pretrained embedding words with 100 dimensions. These 2 models will then be evaluated on each of the 3 cleaned datasets as well as on the raw data. <br>
+Finally, I will evaluate the different models on the mean column-wise ROC AUC. In other words, the average of the individual AUCs of each predicted column. To finish, I will give my suggestion to go beyond and try to ameliorate the score. 
+
+#Exploratory Data Analysis
+
+I start by [downloading](https://www.kaggle.com/c/jigsaw-toxic-comment-classification-challenge/data) the data on Kaggle's website and I load it in R. Let's have a first look at the comments:
+
+```{r, cache=FALSE, message=FALSE, warning=FALSE, fig.width=14, fig.height=8}
+#to manipulate data
+if (!require("tidyverse")) install.packages("tidyverse")
+library("tidyverse")
+if (!require("DT")) install.packages("DT")
+library(DT)
+if (!require("tidytext")) install.packages("tidytext")
+library(tidytext)
+if (!require("qdapRegex")) install.packages("qdapRegex")
+library(qdapRegex) 
+if (!require("stringr")) install.packages("stringr")
+library(stringr)
+if (!require("tm")) install.packages("tm")
+library(tm) 
+if (!require("caret")) install.packages("caret")
+library(caret)
+setwd("/Users/user/Desktop/GitHub/toxic_comments")
+comments = readRDS("data/comments.rds")
+
+datatable(comments[1:30,], style="bootstrap", 
+          class="table-condensed", 
+          options = list(dom = 'tp',
+                         scrollX = TRUE,
+                         pageLength = 3))
+```
+
+Some words are misspelled and some others are written in a slang or sms language. Hence I decide to preclean the data. To do this I will use the functions `preclean()` and `sms_vocab()` that I have written. You can find them on my [Github](https://github.com/krosamont/toxic_comments). 
+
+```{r, include = FALSE}
+if (!require("keras")) install.packages("keras")
+library("keras") #keras::install_keras() if keras is not already installed
+if (!require("tidyverse")) install.packages("tidyverse")
+library("tidyverse")
+if (!require("DT")) install.packages("DT")
+library(DT)
+if (!require("tidytext")) install.packages("tidytext")
+library(tidytext)
+if (!require("qdapRegex")) install.packages("qdapRegex")
+library(qdapRegex) 
+if (!require("stringr")) install.packages("stringr")
+library(stringr)
+if (!require("tm")) install.packages("tm")
+library(tm) 
+if (!require("caret")) install.packages("caret")
+library(caret)
+
+source("useful_functions.R")
+comments = readRDS("data/comments_preclean.rds")
+```
+
+```{r, cache=FALSE, message=FALSE, warning=FALSE, eval = FALSE}
+#load the external functions such as preclean() or sms_vocab()
+source("useful_functions.R")
+
+#precleaning comments
+comments = comments %>%
+        mutate(comment_text = toloIr(preclean(comment_text)), id_num=1:nrow(comments)) %>%
+        mutate(comment_text = sms_vocab(comment_text))
+#saveRDS(comments, "comments_preclean.rds")
+```
+
+When counting *normal* comments, we can consider that there are 7 categories of comments. I will first study each type of comment and then see their distribution:
+
+```{r, cache=FALSE, message=FALSE, warning=FALSE, fig.width=14, fig.height=8}
+#to manipulate data
+
+toxic = comments %>%
+        filter(toxic==1) 
+        
+sev_toxic = comments %>%
+        filter(severe_toxic==1)
+        
+obscene = comments %>%
+        filter(obscene==1)
+        
+threat = comments %>%
+        filter(threat==1)
+        
+insult = comments %>%
+        filter(insult==1)
+        
+id_hate = comments %>%
+        filter(identity_hate==1)
+        
+normal = comments %>%
+        filter(toxic==0 & severe_toxic==0 & obscene==0 & threat==0 & insult==0 & identity_hate==0)
+
+docs = list(normal=normal, toxic=toxic, sev_toxic=sev_toxic, obscene=obscene, threat=threat, insult=insult,  id_hate=id_hate)
+
+distrib = docs %>%
+        map(nrow) %>%
+        reduce(rbind) %>%
+        as.data.frame(row.names = FALSE)
+
+distrib = distrib %>%
+        rename(count=V1) %>%
+        mutate( percent = round(100*count/nrow(comments), 2), 
+                type = c("normal", names(comments)[3:8]) )
+
+ggplot(distrib, aes(x = reorder(type, -percent), count, fill = type)) +
+        geom_col(show.legend = FALSE) +
+        labs(x = NULL, y = "count comments") +
+        geom_text(aes(label=paste0(percent,"%")), vjust=-0.3, color="black", size=3.5) +
+        theme_minimal()
+```
+
+First of all, I see that I have imbalanced data. Almost 90% of the comments are not problematic. 
+Hence, I want to see what words define the type of comments. 
+
+##The relevant words: tf-idf
+
+To distinguish the most relevant words per type of comments, I proceed with a document classification analysis. Each comment of the same type is seen as one part of a document. Therefore, I have 7 documents (6  type of toxic comments and the normal one), one per type of comments. To identify the relevant words I use the tf-idf metric (term frequency–inverse document frequency). This metric shows the most relevant words by type of comments. 
+The words that are frequent but specific to a class of document will have a high tf-idf, unlike words that are present in all documents. You have the complete definition of [tf-idf](https://en.wikipedia.org/wiki/Tf%E2%80%93idf) on Wikipedia.
+
+```{r, cache=FALSE, message=FALSE, warning=FALSE, fig.width=14, fig.height=8}
+
+docs_freq = docs %>%
+        map("comment_text") %>%
+        #separate is from the useful_function.R
+        map(separate) %>% 
+        map(freqWord) %>%
+        map2(names(docs),~mutate(.x, type=.y)) %>%
+        reduce(rbind)               
+
+top15 = docs_freq %>%
+        bind_tf_idf(word, type, Freq) %>%
+        filter(tf_idf>0) %>%
+        arrange(desc(tf_idf))  %>%
+        group_by(type) %>% 
+        top_n(15) 
+
+
+datatable(top15, style="bootstrap", 
+          class="table-condensed", 
+          options = list(dom = 'tp',
+                         scrollX = TRUE,
+                         pageLength = 5))
+```
+
+```{r, cache=FALSE, message=FALSE, warning=FALSE, fig.width=14, fig.height=8}
+ggplot(top15, aes(x = reorder(word, tf_idf), tf_idf, fill = type)) +
+        geom_col(show.legend = FALSE) +
+        labs(x = NULL, y = "tf-idf")  +
+        theme_minimal() +
+        facet_wrap(~type, ncol = 2, scales = "free") +
+        coord_flip()
+```
+
+The plot above shows that there are a lot of ways to write the same words, some of the words present in the list are just synonyms, others are names, and some are still misspelled. When I look deeper in the comments, I see some comments like this one:
+
+```{r, cache=FALSE, message=FALSE, warning=FALSE}
+mothjer = comments$comment_text[(grep("mothjer", comments$comment_text))[1]]
+split_mothjer = unlist(str_split(mothjer,pattern = " "))
+#l_mothjer = length(split_mothjer)
+#l_unique =  length(unique(split_mothjer))
+
+#print(l_mothjer)
+#print(l_unique)                                
+print(substr(mothjer,1,90))
+```
+We see that the comments has a small vocabulary compare to his length. Hence I want to see if there is a clear correlation between the type of comments and their ratio #(number of unique words)/#(length of the comment).
+
+##Relation between the type of comments and the repetition words?
+
+I want to see if there is a lot of long comments with a small vocabulary like the one seen above (this comment repeats 6 different words 78 times! This is the true definition of trolling :p ) and if it is specific to a type of comment:
+
+```{r, include = FALSE}
+char_comments = readRDS("data/length_comments.rds") 
+```
+
+```{r, cache=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+char_comments = docs %>%
+        map("comment_text") %>%
+        map(length_comments) %>%
+        map2(names(docs),~mutate(.x, type=.y)) %>%
+        reduce(rbind) 
+#saveRDS(char_comments,"length_comments.rds")
+```
+
+
+```{r, cache=FALSE, message=FALSE, warning=FALSE, fig.width=14, fig.height=8}
+
+#To remove the outlier that has more than 1500 words
+ggplot(char_comments %>% filter(l_comment<1500), aes(unique_per_l, l_comment))+
+        labs(x = "numbe of words", y = "unique words") + geom_point(aes(colour = type)) +
+        theme_minimal()
+
+```
+
+```{r, cache=FALSE, message=FALSE, warning=FALSE, fig.width=14, fig.height=8}
+
+#To remove the outlier that has more than 1500 words
+ggplot(char_comments, aes(x = type, y = unique_per_l, fill = type)) +
+        geom_boxplot(alpha=0.7, outlier.alpha = 0) +
+        scale_y_continuous(name = "Unique words per word comments",
+                           #breaks = seq(0, 175, 25),
+                           limits=c(0.45, 1.10)) +
+        scale_x_discrete(name = "Type of comments") +
+        ggtitle("Boxplot of unique words per comments") +
+        theme_bw()
+
+```
+
+Apparently it is not. Hence, I will not go further in this direction since I don't see any clear distinction between the type of comments.
+
+##Words not present in GloVe
+
+Let's go back to the cleaning step. As you can see there are too many comments to clean all of them. We will focus on the ones that have the highest tf-idf score and the ones that are highly frequent in the data. To detect the misspelled words, I will use the GloVe pretrained word embeddings. This matrix is made of 400 000 words. Hence it represents a large vocabulary of words commonly used on the Internet. You can read the description [here](https://nlp.stanford.edu/projects/glove/).
+
+
+```{r, include = FALSE}
+unknown = readRDS("data/unknown_words.rds") %>%
+        arrange(desc(Freq))
+
+```
+
+```{r, cache=FALSE, message=FALSE, eval=FALSE}
+#First I download the pretrained word embeddings matrix
+wgt = readRDS("data/glove.6B/glove_6B_50d.rds")
+wgt = wgt %>%
+        mutate(word=gsub("[[:punct:]]"," ", rm_white(word) ))
+
+#We keep only the words
+dic_words = wgt$word
+
+#We check all the words that are not presents in GloVe
+unknown = docs %>% 
+        map("comment_text") %>% 
+        map(str_split, pattern = " ") %>% 
+        map(unlist) %>% 
+        map(table) %>%
+        map(as.data.frame) %>%
+        map2(names(docs), ~mutate(.x,type=.y)) %>%
+        reduce(rbind) %>% 
+        rename(word=Var1) %>%
+        filter(!word  %in% wgt$word) %>%
+        arrange(desc(Freq))
+#saveRDS(unknown, "data/unknown_words.rds")
+```
+
+
+```{r, cache=FALSE, message=FALSE, warning=FALSE, fig.width=14, fig.height=8}
+datatable(unknown, style="bootstrap", 
+          class="table-condensed", 
+          options = list(dom = 'tp',
+                         scrollX = TRUE,
+                         pageLength = 5))
+```
+
+So I clean the comments a second time. One of the main advantages of cleaning the comments is that it reduces size of the vocabulary size. So I will go with 2 levels of cleaning, the first level consists of replacing the words that are misspelled by the correct orthography (reducing vocabulary size and finding the word in the GloVe vocabulary). Then in the second level of cleaning I will stem the comments to have even a smaller vocabulary. I will save the first level as `comments_clean`, the second level as `comments_stem`. Then I add a third type of data cleaning. I call the dataset `comments_tf_idf`. This data set will only keep the 15 000 words with the highest tf-idf value.
+
+```{r, include = FALSE}
+comments_clean = readRDS("data/comments_clean.rds") 
+comments_stem = readRDS("data/comments_stem.rds") 
+comments_tf_idf = readRDS( "data/comments_tf_idf.rds")
+```
+
+```{r, cache=FALSE, message=FALSE, eval=FALSE}
+comments_clean = comments %>%
+        mutate(comment_text = clean(comment_text)) %>% 
+        mutate(comment_text = removeWords(comment_text, c("supertr0ll", "tommy2010", "bunksteve",
+                                                          "mothjer", "fan1967", "youcaltlas",
+                                                          "notrhbysouthbanof", "bleachanhero",
+                                                          "couriano", "jéské",stopwords("english"))
+                                          )
+               ) %>%
+        mutate(comment_text = removeNumbers(comment_text))
+#saveRDS(comments_clean, "data/comments_clean.rds")
+
+comments_stem = comments_clean %>% 
+        mutate(comment_text = stemDocument(comment_text, language = "english")) 
+#saveRDS(comments_clean, "data/comments_stem.rds")
+
+tf_idf_vocab = docs_tf_idf %>%
+        mutate(word = removeNumbers(as.character(word))) %>% 
+        .[1:15000,"word"]
+
+comments_tf_idf = comments %>%
+        mutate(comment_text = tf_idf_words(removeNumbers(comment_text)))
+#saveRDS(comments_clean, "data/comments_tf_idf.rds")
+```
+
+#Neural Network modeling
+
+## Splitting the dataset in 2 parts
+
+Before training our model I need to separate our dataset in 2 parts: the training and the validation sets, with a partition 80%/20%. I will train the neural network on 80% of the comments then I will keep the 20% to validate it. 
+First I want to be sure that they are equally distributed:
+
+```{r, warning=FALSE, fig.width=14, fig.height=8}
+ 
+set.seed(3456)
+
+trainIndex = createDataPartition(comments$id_num, p = .8, list = FALSE)
+
+commentsTrain = comments[ trainIndex,]
+
+distribTrain = commentsTrain[,3:8] %>%
+        map(sum) %>%
+        reduce(rbind) %>%
+        as.data.frame(row.names = FALSE)
+distribTrain = rbind(distribTrain,
+                     nrow(commentsTrain)-sum(distribTrain)) %>%
+        rename(count=V1) %>%
+        mutate(percent = round(100*count/sum(count),2),
+               sample="train")
+
+distribTrain$type = c(names(commentsTrain[3:8]),"none")
+distribTrain = distribTrain %>% 
+        arrange(desc(count))
+
+commentsTest  = comments[-trainIndex,]
+
+distribTest = commentsTest[,3:8] %>%
+        map(sum) %>%
+        reduce(rbind) %>%
+        as.data.frame(row.names = FALSE)
+distribTest = rbind(distribTest,
+                    nrow(commentsTest)-sum(distribTest)) %>%
+        rename(count=V1) %>%
+        mutate(percent = round(100*count/sum(count),2),
+               sample="test")
+
+distribTest$type = c(names(commentsTest[3:8]),"none") 
+
+distrib = rbind(distribTrain, distribTest) %>%
+        mutate(type=gsub("identity","id", type)) %>%
+        mutate(type=gsub("severe","sev", type))
+
+ggplot(distrib, aes(x = reorder(type, -percent), 
+                    percent, fill = type)) +
+        geom_col(show.legend = FALSE) +
+        labs(x = NULL, y = "distribution") +
+        theme_minimal() +
+        geom_text(aes(label=paste0(percent,"%")), 
+                  vjust=-0.3, color="black", 
+                  size=3.5) +
+        facet_wrap(~sample, ncol = 1, 
+                   nrow=2, scales = "free")
+```
+
+We can see that they have the same distribution, therefore, I can build the neural network model.
+
+## Using Keras to train our neuronal network model
+
+Now I work with the raw data and the 3 clean datasets. I will build 8 models, 4 with pretrained embedding words, 4 without. Then each model will use one of the 4 datasets: 
+
+```{r, eval = FALSE}
+comments = readRDS("data/comments.rds")
+comments_train = comments[trainIndex,]
+comments_tf_idf_train =comments_tf_idf[trainIndex,]
+comments_clean_train = comments_clean[trainIndex,]
+comments_stem_train = comments_stem[trainIndex,]
+```
+
+Then I build the neural network with 2 GRU layers, containing 64 units for each. 
+I add the layers called `layer_max_pooling_1d` to downsample the number of parameters in the neural network model 
+and I add the layer called `layer_dropout()` to prevent overfitting.
+
+```{r, eval = FALSE}
+for(i in 1:4){
+        if(i==1){final_data = comments_train}
+        else if(i==2){final_data = comments_tf_idf_train}
+        else if(i==3){final_data = comments_clean_train}
+        else{final_data = comments_stem_train}
+        
+        max_words = 20000
+        
+        wordseq = text_tokenizer(num_words = max_words) %>%
+                fit_text_tokenizer(final_data$comment_text)
+        
+        #word index
+        word_index = wordseq$word_index
+        maxl = 300
+        
+        # The 1 corresponds to the book methodology
+        sequences = texts_to_sequences(wordseq, 
+                                       final_data$comment_text )
+        
+        train_data = pad_sequences(sequences, 
+                                   maxlen = maxl)
+        
+        train_label = as.matrix(final_data[,3:8])
+        
+        ndim = 50
+        
+        model = keras_model_sequential() %>%
+                layer_embedding(input_dim = max_words, 
+                                output_dim = ndim) %>%
+                layer_gru(units = 64, return_sequences = TRUE) %>%
+                layer_max_pooling_1d(  ) %>%
+                layer_dropout(rate = 0.3) %>% 
+                layer_gru(units = 64) %>%
+                layer_dropout(rate = 0.3) %>% 
+                layer_dense(units = 6, activation = "sigmoid")
+        
+        model %>% compile(
+                optimizer = "adam",
+                loss = "binary_crossentropy",
+                metrics = c("acc")
+        )
+        
+        history = model %>% fit(
+                train_data, train_label,
+                epochs = 10,
+                batch_size = 128,
+                validation_split = 0.2,
+                callbacks = list(
+                        callback_model_checkpoint(
+                                paste0("model/checkpoints_model1_",
+                                       i,".h5"), 
+                                save_best_only = TRUE
+                                ),
+                        callback_early_stopping(
+                                monitor = "val_loss", 
+                                min_delta = 0, 
+                                patience = 0,
+                                verbose = 0, 
+                                mode = c("auto", "min", "max")
+                                )               
+                        )
+                )
+        
+        wgt100 = readRDS("data/glove.6B/glove_6B_100d.rds") %>%
+                mutate(word=rm_white( 
+                        gsub("[[:punct:]]"," ", word) 
+                        )
+                       )
+        #wgt300 = readRDS("glove.6B/glove_6B_300d.rds") %>%
+        #        mutate(word=rm_white( gsub("[[:punct:]]"," ", word) ))
+        
+        wordindex = unlist(wordseq$word_index)
+        
+        dic= data.frame(word=names(wordindex), 
+                        key = wordindex,row.names = NULL) %>%
+                arrange(key) %>% .[1:max_words,]
+        #I couldn't run the third model with wgt300 but you can try it
+        #for(k in 1:2){
+         #       if(k==1){
+        k=1
+        wgt = wgt100
+               # }else{wgt = wgt300}
+                
+                
+        w_embed = dic %>% 
+                left_join(wgt) 
+                
+        J = ncol(w_embed)
+                
+        w_embed = .[1:(max_words-1),3:J] %>%
+                mutate_all(as.numeric) %>%
+                mutate_all(funs(replace(., is.na(.), 0))) %>%
+                as.matrix()
+                
+        w_embed = rbind(rep(0, J), w_embed)
+                
+        matrix_w = mapply(w_embed, FUN=as.numeric)
+                
+        #ndim = J
+        #vocab_size=nrow(dic)
+        matrix_w =  matrix(data=matrix_w, ncol=J)
+        
+        #matrix_w = rbind(rep(0, 50), matrix_w)
+        w_embed = list(array(matrix_w, c(max_words, J)))
+                
+                
+        #Example with embedding_Iight
+        model = keras_model_sequential() %>%
+                layer_embedding(input_dim = max_words, 
+                                output_dim = ndim, 
+                                input_length = maxl, 
+                                Iights = w_embed, 
+                                trainable=FALSE) %>%
+                layer_gru(units = 64, return_sequences = TRUE) %>%
+                layer_max_pooling_1d(  ) %>%
+                layer_dropout(rate = 0.3) %>% 
+                layer_gru(units = 64) %>%
+                layer_dropout(rate = 0.3) %>% 
+                layer_dense(units = 6, activation = "sigmoid")
+                
+        get_layer(model, index = 1) %>%
+                set_Iights(w_embed) %>%
+                freeze_Iights()
+                
+        model %>% compile(
+                optimizer = "adam",
+                loss = "binary_crossentropy",
+                metrics = c("acc")
+        )
+                
+        history = model %>% fit(
+                train_data, train_label,
+                epochs = 10,
+                batch_size = 128,
+                validation_split = 0.2,
+                callbacks = list(
+                        callback_model_checkpoint(
+                                paste0("model/checkpoints_model",
+                                        k,"_",i,".h5"), 
+                                save_best_only = TRUE
+                                ),
+                        callback_early_stopping(
+                                monitor = "val_loss", 
+                                min_delta = 0, 
+                                patience = 0,
+                                verbose = 0, 
+                                mode = c("auto", "min", "max")
+                                )
+                        )
+                )
+                
+                
+#        }
+        
+        
+} 
+```
+
+## Model Evaluation
+
+Now I work on the validation set to see how the different models perform on validation comments (this dataset represents 20% comments of our original dataset). First I keep only the comments that were not in the training set:
+
+```{r, eval = FALSE}
+comments_test = comments[-trainIndex,]
+comments_tf_idf_test = comments_tf_idf[-trainIndex,]
+comments_clean_test = comments_clean[-trainIndex,]
+comments_stem_test = comments_stem[-trainIndex,]
+```
+
+Then I plot the ROC curves for each type of comments. These plots show how the 8 models perform on the 6 type of comments:
+
+```{r, include = FALSE}
+roc = readRDS("data/roc_total.rds")
+auc = readRDS("data/auc_total.rds")
+```
+
+```{r, eval = FALSE}
+t_roc = NULL
+t_auc = NULL
+
+
+roc_auc = function(x, type){
+        if(type=="toxic"){ 
+                roc = roc.curve(x$toxic, x$pred.toxic, plotit = FALSE)
+        } else if( type == "severe_toxic"){
+                roc = roc.curve(x$severe_toxic, x$pred.severe_toxic, plotit = FALSE)
+        } else if(type == "obscene"){
+                roc = roc.curve(x$obscene, x$pred.obscene, plotit = FALSE)
+        } else if(type== "threat"){
+                roc = roc.curve(x$threat, x$pred.threat, plotit = FALSE)
+        } else if(type == "insult"){
+                roc = roc.curve(x$insult, x$pred.insult, plotit = FALSE)
+        } else if(type== "id_hate"){
+                roc = roc.curve(x$identity_hate, x$pred.identity_hate, plotit = FALSE)
+        }
+        
+        
+        res = list(auc=data.frame(auc=roc[[2]], model=x$model, type=type)[1,], roc=data.frame(fp=roc[[3]], tp=roc[[4]], type=type, model=rep(x$model, length(roc[[4]]))
+        ))
+        return(res)
+}
+
+
+for(i in 1:4){
+        if(i==1){final_data = comments_test}
+        else if(i==2){final_data = comments_tf_idf_test}
+        else if(i==3){final_data = comments_clean_test}
+        else{final_data = comments_stem_test}
+        
+        for(k in 1:2){
+                
+                wordseq = text_tokenizer(num_words = max_words) %>%
+                        fit_text_tokenizer(final_data$comment_text)
+                
+                
+                # The 1 corresponds to the book methodology
+                sequences = texts_to_sequences(wordseq, 
+                                               final_data$comment_text )
+                test_data = pad_sequences(sequences, 
+                                          maxlen = maxl)
+                model = load_model_hdf5(
+                        paste0(
+                                "model/checkpoints_model",
+                                k,"_",i,".h5")
+                        )
+                
+                pred = model %>%
+                        predict_proba(test_data) %>%
+                        cbind(id=comments_test$id, comments_test[3:8]) %>%
+                        mutate(model=paste0("model",k,"_",i))
+                
+                t = c("toxic", "severe_toxic", "obscene", "threat", "insult", "id_hate")
+                names(pred)[1:6] = paste0("pred.",t) 
+                
+                auc_model = map(t,function(x){roc_auc(pred,x)}) %>%
+                        map("auc") %>%
+                        reduce(rbind)
+                t_auc = rbind(t_auc, auc_model)
+                
+                roc_model = map(t,
+                                function(x){
+                                        roc_auc(pred,x)
+                                        }) %>%
+                        map("roc") %>%
+                        reduce(rbind)
+                t_roc = rbind(t_roc, roc_model) %>%
+                        group_by_all() %>%
+                        filter(row_number()==1)
+                cat(paste0(
+                        "Done for model ",
+                        k, " with data ",i, 
+                        " at ", Sys.time(),
+                        "\n" ))
+        }
+        #saveRDS(t_auc, "data/auc_total.rds")
+        #saveRDS(t_roc, "data/roc_total.rds")
+        
+}
+```
+```{r, warning=FALSE, fig.width=14, fig.height=8}
+ggplot(roc, aes(x=fp, y=tp, colour = model)) + 
+        labs(x ="FALSE POSITIVE", 
+             y = "TRUE POSITIVE") +
+        geom_line() + 
+        theme_minimal()+
+        facet_wrap(~type, 
+                   ncol = 2, 
+                   scales = "free")
+```
+
+
+Then I compare the average performance of the different models to see which one is the best overall:
+
+```{r, warning=FALSE, fig.width=14, fig.height=8}
+res = auc %>%
+        group_by(model) %>%
+        summarise(average_auc= mean(auc)) %>%
+        arrange(desc(average_auc))  %>%
+        mutate( preprocess = case_when(
+                grepl("_1",model) ~ "raw"   ,
+                grepl("_2",model) ~ "top tf-idf"   ,
+                grepl("_3",model) ~ "clean"   ,
+                grepl("_4",model) ~ "stemmize"
+                ),
+                pretrained_embed = case_when(
+                        grepl("l1",model) ~ "none"   ,
+                        grepl("l2",model) ~ "Glove6B.100d"
+                )
+        )
+
+datatable(res, style="bootstrap", 
+          class="table-condensed", 
+          options = list(dom = 'tp',
+                         scrollX = TRUE,
+                         pageLength = 10))
+```
+
+#Conclusion
+
+Actually the best model is the one that uses raw data with pretrained embeddings. It's a huge surprise. The main difference between the 3 clean datasets and the original one is the fact that every comment where turned to lower case in the clean one. To go further in this competition I would recommend to try the following things:<br>
+
+• clean data but to take care of the letter case<br>
+• try also LSTM, bidirectional LSTM, bidirectionel GRU models<br>
+• Try ensemble methods to increase the score<br>
+• Try other pretrained embedding words<br>
+• Go on :aggle, read comments, articles and keep trying!
